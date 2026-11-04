@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform-lab
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform-api
+  namespace: platform-lab
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: platform-api}
+  strategy:
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  template:
+    metadata:
+      labels: {app: platform-api}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001}
+      containers:
+        - name: api
+          image: cloud-platform-lab:ci
+          imagePullPolicy: IfNotPresent
+          ports: [{containerPort: 8080, name: http}]
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          startupProbe:
+            httpGet: {path: /livez, port: http}
+            failureThreshold: 20
+            periodSeconds: 2
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: {path: /livez, port: http}
+            periodSeconds: 5
+          volumeMounts: [{name: temp, mountPath: /tmp}]
+      volumes: [{name: temp, emptyDir: {sizeLimit: 16Mi}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: platform-api, namespace: platform-lab}
+spec:
+  selector: {app: platform-api}
+  ports: [{port: 8080, targetPort: http, name: http}]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: platform-api, namespace: platform-lab}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: platform-api}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: platform-api, namespace: platform-lab}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: platform-api}
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 70}

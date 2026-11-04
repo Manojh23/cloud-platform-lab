@@ -1,0 +1,44 @@
+name: Platform validation
+on: [push, pull_request]
+permissions: {contents: read}
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: python -m unittest discover -s tests -v
+  infrastructure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform -chdir=terraform init -backend=false
+      - run: terraform -chdir=terraform validate
+  kubernetes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with: {cluster_name: platform-lab}
+      - run: docker build -t cloud-platform-lab:ci .
+      - run: kind load docker-image cloud-platform-lab:ci --name platform-lab
+      - run: kubectl apply -f k8s/platform.yaml
+      - run: kubectl -n platform-lab rollout status deployment/platform-api --timeout=180s
+      - name: Exercise readiness failure and recovery
+        run: |
+          set -euo pipefail
+          POD=$(kubectl -n platform-lab get pods -l app=platform-api -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n platform-lab exec "$POD" -- python -c 'from pathlib import Path; Path("/tmp/platform-not-ready").touch()'
+          kubectl -n platform-lab wait --for=condition=Ready=false "pod/$POD" --timeout=60s
+          kubectl -n platform-lab exec "$POD" -- python -c 'from pathlib import Path; Path("/tmp/platform-not-ready").unlink()'
+          kubectl -n platform-lab wait --for=condition=Ready "pod/$POD" --timeout=60s
+          kubectl -n platform-lab port-forward service/platform-api 8080:8080 > /tmp/forward.log 2>&1 &
+          FORWARD_PID=$!
+          trap 'kill "$FORWARD_PID"' EXIT
+          for attempt in $(seq 1 30); do curl -fsS http://127.0.0.1:8080/readyz && break || sleep 1; done
+          curl -fsS http://127.0.0.1:8080/work
+          curl -fsS http://127.0.0.1:8080/metrics | grep platform_work_requests_total
+      - if: failure()
+        run: kubectl -n platform-lab get pods,events; kubectl -n platform-lab logs deployment/platform-api --all-containers
